@@ -1,5 +1,6 @@
 const express = require("express");
 const { spawn } = require("node:child_process");
+const fs = require("node:fs");
 const path = require("node:path");
 
 const app = express();
@@ -11,8 +12,12 @@ app.use(express.json({ limit: "200kb" }));
 const HOST = process.env.HOST || "127.0.0.1";
 const PORT = Number.parseInt(process.env.PORT || "3000", 10);
 
-const MINER_API_URL = process.env.MINER_API_URL || "http://127.0.0.1:18088";
+const XMRIG_HTTP_HOST = process.env.XMRIG_HTTP_HOST || "127.0.0.1";
+const XMRIG_HTTP_PORT = Number.parseInt(process.env.XMRIG_HTTP_PORT || "18088", 10);
+const MINER_API_URL =
+  process.env.MINER_API_URL || `http://${XMRIG_HTTP_HOST}:${XMRIG_HTTP_PORT}`;
 const MINER_API_TOKEN = process.env.MINER_API_TOKEN || "";
+const HASHVAULT_API_BASE = process.env.HASHVAULT_API_BASE || "https://api.hashvault.pro";
 const WALLET_RPC_URL =
   process.env.WALLET_RPC_URL || "http://127.0.0.1:18082/json_rpc";
 const WALLET_RPC_USER = process.env.WALLET_RPC_USER || "";
@@ -24,6 +29,9 @@ const DASH_TOKEN = process.env.DASH_TOKEN || "";
 
 const XMRIG_PATH = process.env.XMRIG_PATH || "";
 const XMRIG_ARGS_JSON = process.env.XMRIG_ARGS_JSON || "";
+const AUTO_START_MINER = ["1", "true", "yes", "on"].includes(
+  String(process.env.AUTO_START_MINER || "").toLowerCase()
+);
 
 function isLoopback(remoteAddress) {
   if (!remoteAddress) return false;
@@ -85,6 +93,53 @@ function atomicToXmr(atomic) {
   return n / 1e12;
 }
 
+function getArgValue(args, flag) {
+  const idx = args.indexOf(flag);
+  if (idx < 0) return null;
+  return args[idx + 1] ?? null;
+}
+
+function getXmrigPoolAndWallet() {
+  try {
+    const args = parseXmrigArgsJson();
+    const pool = getArgValue(args, "-o");
+    const wallet = getArgValue(args, "-u");
+    return { pool: typeof pool === "string" ? pool : null, wallet: typeof wallet === "string" ? wallet : null };
+  } catch {
+    return { pool: null, wallet: null };
+  }
+}
+
+async function fetchHashvaultWalletStats(walletAddress) {
+  const url =
+    `${HASHVAULT_API_BASE}/v3/monero/wallet/${walletAddress}` +
+    "/stats?chart=false&inactivityThreshold=10&order=name&period=daily&poolType=false&workers=false";
+
+  const resp = await fetch(url, { headers: { accept: "application/json" } });
+  const json = await resp.json().catch(() => null);
+  if (!resp.ok || !json) {
+    throw new Error(`HashVault API unavailable (HTTP ${resp.status})`);
+  }
+  return json;
+}
+
+function extractHashvaultUnconfirmedAtomic(unconfirmedBalance) {
+  if (typeof unconfirmedBalance === "number") return unconfirmedBalance;
+  if (!unconfirmedBalance || typeof unconfirmedBalance !== "object") return null;
+
+  const collectiveTotal =
+    typeof unconfirmedBalance.collective?.total === "number"
+      ? unconfirmedBalance.collective.total
+      : 0;
+  const soloTotal =
+    typeof unconfirmedBalance.solo?.total === "number"
+      ? unconfirmedBalance.solo.total
+      : 0;
+
+  const sum = collectiveTotal + soloTotal;
+  return sum > 0 ? sum : null;
+}
+
 async function walletRpc(method, params) {
   const body = {
     jsonrpc: "2.0",
@@ -120,6 +175,17 @@ async function walletRpc(method, params) {
 
 let xmrigProcess = null;
 let xmrigLastExit = null;
+let xmrigLogBuffer = "";
+
+function appendXmrigLog(chunk) {
+  if (!chunk) return;
+  const text = Buffer.isBuffer(chunk) ? chunk.toString("utf8") : String(chunk);
+  xmrigLogBuffer += text;
+  const maxLen = 10000;
+  if (xmrigLogBuffer.length > maxLen) {
+    xmrigLogBuffer = xmrigLogBuffer.slice(xmrigLogBuffer.length - maxLen);
+  }
+}
 
 function getXmrigStatus() {
   if (xmrigProcess && xmrigProcess.exitCode === null) {
@@ -137,6 +203,84 @@ function parseXmrigArgsJson() {
   return parsed;
 }
 
+function validateXmrigArgs(args) {
+  const joined = args.join(" ");
+  const placeholderPatterns = [
+    "<POOL_HOST>:<PORT>",
+    "POOL_HOST:PORT",
+    "<YOUR_REAL_XMR_ADDRESS>",
+    "YOUR_REAL_XMR_ADDRESS"
+  ];
+  if (placeholderPatterns.some((p) => joined.includes(p))) {
+    return {
+      ok: false,
+      error:
+        "XMRIG_ARGS_JSON still contains placeholders. Replace POOL_HOST:PORT and YOUR_REAL_XMR_ADDRESS with real values."
+    };
+  }
+
+  const poolIdx = args.indexOf("-o");
+  const pool = poolIdx >= 0 ? args[poolIdx + 1] : null;
+  if (!pool || typeof pool !== "string" || !pool.includes(":")) {
+    return {
+      ok: false,
+      error:
+        "Missing pool in XMRIG_ARGS_JSON. Add: \"-o\", \"pool.example.com:3333\""
+    };
+  }
+  if (pool.includes("<") || pool.includes(">")) {
+    return { ok: false, error: "Pool contains invalid characters: < or >" };
+  }
+
+  const userIdx = args.indexOf("-u");
+  const wallet = userIdx >= 0 ? args[userIdx + 1] : null;
+  if (!wallet || typeof wallet !== "string") {
+    return {
+      ok: false,
+      error:
+        "Missing wallet address in XMRIG_ARGS_JSON. Add: \"-u\", \"YOUR_XMR_ADDRESS\""
+    };
+  }
+  if (wallet.includes("<") || wallet.includes(">")) {
+    return { ok: false, error: "Wallet contains invalid characters: < or >" };
+  }
+  if (wallet.length < 90) {
+    return {
+      ok: false,
+      error:
+        "Wallet address looks too short. Use a real Monero address (usually starts with 4 or 8)."
+    };
+  }
+
+  return { ok: true };
+}
+
+function validateXmrigPath() {
+  if (!XMRIG_PATH) return { ok: false, error: "XMRIG_PATH not set" };
+  const resolved = path.isAbsolute(XMRIG_PATH)
+    ? XMRIG_PATH
+    : path.resolve(process.cwd(), XMRIG_PATH);
+
+  let stat;
+  try {
+    stat = fs.statSync(resolved);
+  } catch {
+    return { ok: false, error: `XMRIG_PATH not found: ${resolved}` };
+  }
+
+  if (!stat.isFile()) {
+    return { ok: false, error: `XMRIG_PATH must be a file (binary): ${resolved}` };
+  }
+
+  try {
+    fs.accessSync(resolved, fs.constants.X_OK);
+  } catch {
+    return { ok: false, error: `XMRIG_PATH is not executable: ${resolved}` };
+  }
+
+  return { ok: true, path: resolved };
+}
+
 async function fetchMinerSummary() {
   const headers = { accept: "application/json" };
   if (MINER_API_TOKEN) {
@@ -152,6 +296,64 @@ async function fetchMinerSummary() {
   return json;
 }
 
+function spawnXmrig() {
+  if (xmrigProcess && xmrigProcess.exitCode === null) {
+    return { ok: false, status: 409, error: "Miner already running" };
+  }
+  const xmrigPath = validateXmrigPath();
+  if (!xmrigPath.ok) return { ok: false, status: 400, error: xmrigPath.error };
+
+  let extraArgs = [];
+  try {
+    extraArgs = parseXmrigArgsJson();
+  } catch (err) {
+    return {
+      ok: false,
+      status: 400,
+      error: err instanceof Error ? err.message : "Invalid XMRIG_ARGS_JSON"
+    };
+  }
+
+  const argsValidation = validateXmrigArgs(extraArgs);
+  if (!argsValidation.ok) {
+    return { ok: false, status: 400, error: argsValidation.error };
+  }
+
+  const args = [
+    "--http-enabled",
+    "--http-host",
+    XMRIG_HTTP_HOST,
+    "--http-port",
+    String(XMRIG_HTTP_PORT),
+    ...extraArgs
+  ];
+
+  xmrigLastExit = null;
+  xmrigLogBuffer = "";
+  xmrigProcess = spawn(xmrigPath.path, args, {
+    stdio: ["ignore", "pipe", "pipe"]
+  });
+
+  xmrigProcess.stdout?.on("data", appendXmrigLog);
+  xmrigProcess.stderr?.on("data", appendXmrigLog);
+
+  xmrigProcess.on("exit", (code, signal) => {
+    xmrigLastExit = { code, signal, at: new Date().toISOString() };
+  });
+
+  xmrigProcess.on("error", (err) => {
+    xmrigLastExit = { code: null, signal: null, error: err.message };
+  });
+
+  return {
+    ok: true,
+    status: 200,
+    args,
+    pid: xmrigProcess.pid,
+    xmrigPath: xmrigPath.path
+  };
+}
+
 app.use(requireDashboardAuth);
 app.use(express.static(path.join(__dirname, "public")));
 
@@ -162,56 +364,114 @@ app.get("/api/health", (req, res) => {
 app.get("/api/miner/summary", async (req, res) => {
   try {
     const summary = await fetchMinerSummary();
-    res.json({ summary, process: getXmrigStatus() });
+    res.json({ ok: true, summary, process: getXmrigStatus() });
   } catch (err) {
-    res.status(503).json({
+    res.json({
+      ok: false,
       error: "Miner API not reachable",
       details: err instanceof Error ? err.message : String(err),
-      process: getXmrigStatus()
+      process: getXmrigStatus(),
+      xmrigLog: xmrigLogBuffer ? xmrigLogBuffer.slice(-4000) : ""
+    });
+  }
+});
+
+app.get("/api/pool/stats", async (req, res) => {
+  const { pool, wallet } = getXmrigPoolAndWallet();
+  const walletAddress =
+    typeof req.query.wallet === "string" && req.query.wallet.length > 0
+      ? req.query.wallet
+      : wallet;
+
+  const provider =
+    typeof req.query.provider === "string" && req.query.provider.length > 0
+      ? req.query.provider
+      : pool && pool.includes("hashvault")
+        ? "hashvault"
+        : "hashvault";
+
+  if (!walletAddress) {
+    return res.json({
+      ok: false,
+      provider,
+      pool,
+      wallet: null,
+      error: "Wallet address not available for pool stats"
+    });
+  }
+
+  if (provider !== "hashvault") {
+    return res.json({
+      ok: false,
+      provider,
+      pool,
+      wallet: walletAddress,
+      error: "Unsupported pool provider"
+    });
+  }
+
+  try {
+    const stats = await fetchHashvaultWalletStats(walletAddress);
+    const revenue = stats?.revenue || {};
+    const collective = stats?.collective || {};
+
+    const confirmedAtomic = revenue.confirmedBalance ?? null;
+    const unconfirmedAtomic =
+      extractHashvaultUnconfirmedAtomic(revenue.unconfirmedBalance) ??
+      revenue.pendingBalance ??
+      null;
+    const paidAtomic =
+      revenue.totalPaid ?? revenue.paid ?? revenue.totalPayments ?? null;
+    const thresholdAtomic =
+      revenue.payoutThreshold ?? revenue.payoutThresholdMin ?? null;
+
+    res.json({
+      ok: true,
+      provider,
+      pool,
+      wallet: walletAddress,
+      hashrate_kh:
+        typeof collective.hashRate === "number"
+          ? collective.hashRate / 1000
+          : null,
+      confirmed_xmr: atomicToXmr(confirmedAtomic),
+      unconfirmed_xmr: atomicToXmr(unconfirmedAtomic),
+      paid_xmr: atomicToXmr(paidAtomic),
+      payout_threshold_xmr: atomicToXmr(thresholdAtomic),
+      raw: {
+        collective,
+        revenue
+      }
+    });
+  } catch (err) {
+    res.json({
+      ok: false,
+      provider,
+      pool,
+      wallet: walletAddress,
+      error: "Pool API not reachable",
+      details: err instanceof Error ? err.message : String(err)
     });
   }
 });
 
 app.post("/api/miner/start", requireLocalOrToken, (req, res) => {
-  if (xmrigProcess && xmrigProcess.exitCode === null) {
-    return res.status(409).json({ error: "Miner already running" });
-  }
-  if (!XMRIG_PATH) {
-    return res.status(400).json({ error: "XMRIG_PATH not set" });
-  }
+  const started = spawnXmrig();
+  if (!started.ok) return res.status(started.status).json({ error: started.error });
 
-  let extraArgs = [];
-  try {
-    extraArgs = parseXmrigArgsJson();
-  } catch (err) {
-    return res.status(400).json({
-      error: err instanceof Error ? err.message : "Invalid XMRIG_ARGS_JSON"
-    });
-  }
+  const payload = { ok: true, ...started };
+  delete payload.status;
 
-  const args = [
-    "--http-enabled",
-    "--http-host",
-    "127.0.0.1",
-    "--http-port",
-    "18088",
-    ...extraArgs
-  ];
-
-  xmrigLastExit = null;
-  xmrigProcess = spawn(XMRIG_PATH, args, {
-    stdio: ["ignore", "pipe", "pipe"]
-  });
-
-  xmrigProcess.on("exit", (code, signal) => {
-    xmrigLastExit = { code, signal, at: new Date().toISOString() };
-  });
-
-  xmrigProcess.on("error", (err) => {
-    xmrigLastExit = { code: null, signal: null, error: err.message };
-  });
-
-  res.json({ ok: true, args, pid: xmrigProcess.pid });
+  setTimeout(() => {
+    if (!xmrigProcess || xmrigProcess.exitCode !== null) {
+      return res.status(502).json({
+        error: "XMRig exited immediately",
+        lastExit: xmrigLastExit,
+        xmrigLog: xmrigLogBuffer ? xmrigLogBuffer.slice(-4000) : ""
+      });
+    }
+    res.json(payload);
+  }, 400);
 });
 
 app.post("/api/miner/stop", requireLocalOrToken, (req, res) => {
@@ -229,13 +489,15 @@ app.get("/api/wallet/balance", async (req, res) => {
       account_index: Number.isFinite(accountIndex) ? accountIndex : 0
     });
     res.json({
+      ok: true,
       balance: result.balance,
       unlocked_balance: result.unlocked_balance,
       balance_xmr: atomicToXmr(result.balance),
       unlocked_balance_xmr: atomicToXmr(result.unlocked_balance)
     });
   } catch (err) {
-    res.status(503).json({
+    res.json({
+      ok: false,
       error: "Wallet RPC not reachable",
       details: err instanceof Error ? err.message : String(err)
     });
@@ -289,8 +551,28 @@ app.post("/api/wallet/transfer", requireLocalOrToken, async (req, res) => {
   }
 });
 
-app.listen(PORT, HOST, () => {
+const server = app.listen(PORT, HOST, () => {
   console.log(`Dashboard running on http://${HOST}:${PORT}`);
   console.log(`Miner API: ${MINER_API_URL}`);
   console.log(`Wallet RPC: ${WALLET_RPC_URL}`);
+
+  if (AUTO_START_MINER) {
+    const started = spawnXmrig();
+    if (!started.ok) {
+      console.log(`AUTO_START_MINER failed: ${started.error}`);
+    } else {
+      console.log(`AUTO_START_MINER pid: ${started.pid}`);
+    }
+  }
+});
+
+server.on("error", (err) => {
+  if (err && typeof err === "object" && err.code === "EADDRINUSE") {
+    console.error(
+      `Port already in use: ${HOST}:${PORT}. Stop the other process or run with PORT=3001.`
+    );
+    process.exit(1);
+  }
+  console.error(err);
+  process.exit(1);
 });

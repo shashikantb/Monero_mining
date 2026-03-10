@@ -7,3 +7,8 @@ yarn-debug.log*
 yarn-error.log*
 pnpm-debug.log*
 *.log
+monero-cli.tar.bz2
+monero-*/
+*.keys
+*.wallet
+*.bin

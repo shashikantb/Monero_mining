@@ -66,8 +66,9 @@ function minerStatsToEntries(summaryPayload) {
   ]);
 
   if (!summary) {
-    entries.push(["API", "Not reachable"]);
-    if (proc?.lastExit) entries.push(["Last exit", JSON.stringify(proc.lastExit)]);
+    entries.push(["API", summaryPayload?.ok === false ? "Not reachable" : "-"]);
+    if (proc?.lastExit)
+      entries.push(["Last exit", JSON.stringify(proc.lastExit)]);
     return entries;
   }
 
@@ -93,32 +94,61 @@ function minerStatsToEntries(summaryPayload) {
 async function refreshMiner() {
   const kv = document.getElementById("minerKv");
   const raw = document.getElementById("minerRaw");
-  try {
-    const data = await jsonFetch("/api/miner/summary");
-    renderKv(kv, minerStatsToEntries(data));
+  const data = await jsonFetch("/api/miner/summary");
+  renderKv(kv, minerStatsToEntries(data));
+  if (data.ok) {
     raw.hidden = true;
     setGlobalStatus(true, "OK");
-  } catch (err) {
-    renderKv(kv, minerStatsToEntries({ summary: null, process: null }));
+  } else {
     raw.hidden = false;
-    raw.textContent = err instanceof Error ? err.message : String(err);
-    setGlobalStatus(false, "Miner API unavailable");
+    raw.textContent = [data.error, data.details, data.xmrigLog]
+      .filter(Boolean)
+      .join("\n\n");
+    setGlobalStatus(false, data.error || "Miner API unavailable");
   }
 }
 
 async function refreshWallet() {
   const kv = document.getElementById("walletKv");
-  try {
-    const data = await jsonFetch("/api/wallet/balance");
-    renderKv(kv, [
-      ["Balance (XMR)", formatNumber(data.balance_xmr)],
-      ["Unlocked (XMR)", formatNumber(data.unlocked_balance_xmr)],
-      ["Balance (atomic)", String(data.balance)],
-      ["Unlocked (atomic)", String(data.unlocked_balance)]
-    ]);
-  } catch (err) {
+  const data = await jsonFetch("/api/wallet/balance");
+  if (!data.ok) {
     renderKv(kv, [["Wallet", "RPC unavailable"]]);
+    return;
   }
+  renderKv(kv, [
+    ["Balance (XMR)", formatNumber(data.balance_xmr)],
+    ["Unlocked (XMR)", formatNumber(data.unlocked_balance_xmr)],
+    ["Balance (atomic)", String(data.balance)],
+    ["Unlocked (atomic)", String(data.unlocked_balance)]
+  ]);
+}
+
+function poolStatsToEntries(payload) {
+  const entries = [];
+  entries.push(["Provider", payload?.provider || "-"]);
+  entries.push(["Pool", payload?.pool || "-"]);
+  entries.push(["Wallet", payload?.wallet ? `${payload.wallet.slice(0, 12)}…${payload.wallet.slice(-10)}` : "-"]);
+  if (!payload?.ok) return entries;
+
+  entries.push(["Hashrate (kH/s)", formatNumber(payload?.hashrate_kh)]);
+  entries.push(["Confirmed (XMR)", formatNumber(payload?.confirmed_xmr)]);
+  entries.push(["Unconfirmed (XMR)", formatNumber(payload?.unconfirmed_xmr)]);
+  entries.push(["Paid total (XMR)", formatNumber(payload?.paid_xmr)]);
+  entries.push(["Payout threshold (XMR)", formatNumber(payload?.payout_threshold_xmr)]);
+  return entries;
+}
+
+async function refreshPool() {
+  const kv = document.getElementById("poolKv");
+  const raw = document.getElementById("poolRaw");
+  const data = await jsonFetch("/api/pool/stats");
+  renderKv(kv, poolStatsToEntries(data));
+  if (!data.ok) {
+    raw.hidden = false;
+    raw.textContent = [data.error, data.details].filter(Boolean).join("\n");
+    return;
+  }
+  raw.hidden = true;
 }
 
 async function startMiner() {
@@ -167,6 +197,9 @@ function init() {
       await startMiner();
       await refreshMiner();
     } catch (err) {
+      const raw = document.getElementById("minerRaw");
+      raw.hidden = false;
+      raw.textContent = err instanceof Error ? err.message : "Start failed";
       setGlobalStatus(false, err instanceof Error ? err.message : "Start failed");
     }
   });
@@ -181,6 +214,7 @@ function init() {
   });
 
   document.getElementById("balanceBtn").addEventListener("click", refreshWallet);
+  document.getElementById("poolBtn").addEventListener("click", refreshPool);
 
   document.getElementById("sendBtn").addEventListener("click", async () => {
     const address = document.getElementById("toAddress").value.trim();
@@ -227,8 +261,9 @@ function init() {
 
   refreshMiner();
   refreshWallet();
+  refreshPool();
   setInterval(() => refreshMiner(), 5000);
+  setInterval(() => refreshPool(), 30000);
 }
 
 init();
-
