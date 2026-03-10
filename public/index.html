@@ -1,0 +1,204 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Monero Mining Dashboard</title>
+    <style>
+      :root {
+        color-scheme: dark;
+        --bg: #0b1020;
+        --card: #121a33;
+        --text: #e8ecff;
+        --muted: #a6b0d8;
+        --bad: #ff6b6b;
+        --ok: #4ee7a4;
+        --warn: #ffd166;
+        --border: rgba(255, 255, 255, 0.1);
+      }
+      body {
+        margin: 0;
+        font-family: ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto,
+          Helvetica, Arial, "Apple Color Emoji", "Segoe UI Emoji";
+        background: radial-gradient(1200px 600px at 10% 10%, #182451, var(--bg));
+        color: var(--text);
+      }
+      header {
+        padding: 20px 16px;
+        border-bottom: 1px solid var(--border);
+        position: sticky;
+        top: 0;
+        backdrop-filter: blur(10px);
+        background: rgba(11, 16, 32, 0.65);
+      }
+      h1 {
+        margin: 0;
+        font-size: 18px;
+        font-weight: 700;
+      }
+      main {
+        max-width: 1100px;
+        margin: 0 auto;
+        padding: 18px 16px 60px;
+        display: grid;
+        grid-template-columns: 1fr;
+        gap: 14px;
+      }
+      @media (min-width: 900px) {
+        main {
+          grid-template-columns: 1fr 1fr;
+          align-items: start;
+        }
+      }
+      .card {
+        background: rgba(18, 26, 51, 0.85);
+        border: 1px solid var(--border);
+        border-radius: 14px;
+        padding: 14px;
+        box-shadow: 0 10px 40px rgba(0, 0, 0, 0.35);
+      }
+      .row {
+        display: flex;
+        gap: 10px;
+        flex-wrap: wrap;
+        align-items: center;
+      }
+      .kv {
+        display: grid;
+        grid-template-columns: 180px 1fr;
+        gap: 8px 10px;
+        margin-top: 10px;
+      }
+      .k {
+        color: var(--muted);
+      }
+      .v {
+        overflow-wrap: anywhere;
+      }
+      .status {
+        display: inline-flex;
+        gap: 8px;
+        align-items: center;
+        padding: 4px 10px;
+        border-radius: 999px;
+        border: 1px solid var(--border);
+        font-size: 12px;
+      }
+      .dot {
+        width: 8px;
+        height: 8px;
+        border-radius: 999px;
+        background: var(--muted);
+      }
+      .dot.ok {
+        background: var(--ok);
+      }
+      .dot.bad {
+        background: var(--bad);
+      }
+      button {
+        cursor: pointer;
+        border: 1px solid var(--border);
+        background: rgba(255, 255, 255, 0.06);
+        color: var(--text);
+        border-radius: 10px;
+        padding: 10px 12px;
+        font-weight: 650;
+      }
+      button.primary {
+        background: rgba(78, 231, 164, 0.12);
+        border-color: rgba(78, 231, 164, 0.25);
+      }
+      button.danger {
+        background: rgba(255, 107, 107, 0.12);
+        border-color: rgba(255, 107, 107, 0.25);
+      }
+      input,
+      select {
+        border: 1px solid var(--border);
+        background: rgba(255, 255, 255, 0.05);
+        color: var(--text);
+        border-radius: 10px;
+        padding: 10px 10px;
+        min-width: 240px;
+      }
+      small {
+        color: var(--muted);
+      }
+      pre {
+        white-space: pre-wrap;
+        word-break: break-word;
+        background: rgba(0, 0, 0, 0.25);
+        border: 1px solid var(--border);
+        border-radius: 12px;
+        padding: 10px;
+        margin: 10px 0 0;
+        font-size: 12px;
+        line-height: 1.35;
+      }
+    </style>
+  </head>
+  <body>
+    <header>
+      <div class="row" style="justify-content: space-between">
+        <h1>Monero Mining Dashboard</h1>
+        <div class="row">
+          <span id="globalStatus" class="status">
+            <span id="globalDot" class="dot"></span>
+            <span id="globalText">Loading…</span>
+          </span>
+          <button id="refreshBtn">Refresh</button>
+        </div>
+      </div>
+      <div class="row" style="margin-top: 10px">
+        <label class="row" style="gap: 8px">
+          <span style="color: var(--muted); font-size: 12px">Bearer token</span>
+          <input id="tokenInput" placeholder="Optional (only needed if configured)" />
+        </label>
+        <small>Token is stored only in this browser (localStorage).</small>
+      </div>
+    </header>
+
+    <main>
+      <section class="card">
+        <div class="row" style="justify-content: space-between">
+          <h2 style="margin: 0; font-size: 16px">Miner</h2>
+          <div class="row">
+            <button id="startBtn" class="primary">Start</button>
+            <button id="stopBtn" class="danger">Stop</button>
+          </div>
+        </div>
+        <div class="kv" id="minerKv"></div>
+        <pre id="minerRaw" hidden></pre>
+      </section>
+
+      <section class="card">
+        <div class="row" style="justify-content: space-between">
+          <h2 style="margin: 0; font-size: 16px">Wallet</h2>
+          <button id="balanceBtn">Get balance</button>
+        </div>
+        <div class="kv" id="walletKv"></div>
+
+        <h3 style="margin: 14px 0 8px; font-size: 14px">Transfer</h3>
+        <div class="row">
+          <input id="toAddress" placeholder="Destination address" style="min-width: 520px" />
+        </div>
+        <div class="row" style="margin-top: 10px">
+          <input id="amountXmr" placeholder="Amount (XMR)" />
+          <select id="priority">
+            <option value="0">Priority 0 (default)</option>
+            <option value="1">Priority 1</option>
+            <option value="2">Priority 2</option>
+            <option value="3">Priority 3</option>
+          </select>
+          <button id="sendBtn" class="primary">Send</button>
+          <button id="sweepBtn">Sweep all</button>
+        </div>
+        <pre id="transferResult" hidden></pre>
+      </section>
+    </main>
+
+    <script src="/main.js"></script>
+  </body>
+</html>
+
